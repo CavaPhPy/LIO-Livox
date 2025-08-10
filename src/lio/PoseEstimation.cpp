@@ -1,4 +1,13 @@
 #include "Estimator/Estimator.h"
+// Liu Kaiyang 地图保存相关头文件开始
+// 添加降采样滤波器头文件
+#include <pcl/filters/voxel_grid.h>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+// Liu Kaiyang 地图保存相关头文件结束
+
 typedef pcl::PointXYZINormal PointType;
 
 int WINDOWSIZE;
@@ -35,6 +44,79 @@ double startTime = 0;
 
 nav_msgs::Path laserOdoPath;
 
+// Liu Kaiyang 地图保存相关参数开始
+// 是否开启地图保存
+bool enable_map_save = false;
+// 地图保存路径
+std::string map_save_path = "../../maps/";
+// 点云大小阈值
+int save_threshold = 1000000;
+// 降采样粒度
+float voxel_size = 0.15f;
+// 降采样滤波器
+pcl::VoxelGrid<PointType> voxel_grid;
+// 异步保存相关变量
+std::queue<pcl::PointCloud<PointType>::Ptr> save_queue;
+std::mutex save_queue_mutex;
+std::condition_variable save_condition;
+std::thread save_thread;
+std::atomic<bool> save_thread_running{false};
+
+pcl::PointCloud<PointType>::Ptr pcl_wait_save(new pcl::PointCloud<PointType>());
+// Liu Kaiyang 地图保存相关参数结束
+
+/** \brief Liu Kaiyang 异步点云保存线程函数
+ */
+void saveThread()
+{
+  save_thread_running = true;
+
+  while (save_thread_running)
+  {
+    pcl::PointCloud<PointType>::Ptr cloud_to_save;
+
+    // 等待数据或关闭信号
+    std::unique_lock<std::mutex> lock(save_queue_mutex);
+    save_condition.wait(lock, []
+                        { return !save_queue.empty() || !save_thread_running.load(); });
+
+    if (!save_thread_running.load() && save_queue.empty())
+    {
+      break;
+    }
+
+    if (!save_queue.empty())
+    {
+      cloud_to_save = save_queue.front();
+      save_queue.pop();
+    }
+    lock.unlock();
+
+    // 执行实际的文件保存操作
+    if (cloud_to_save && !cloud_to_save->empty())
+    {
+      // 使用时间戳命名，避免重复
+      auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::system_clock::now().time_since_epoch())
+                     .count();
+      std::string file_path = map_save_path + "scans_" + std::to_string(now) + ".pcd";
+
+      pcl::PCDWriter pcd_writer;
+      int result = pcd_writer.writeBinaryCompressed(file_path, *cloud_to_save);
+
+      if (result == 0)
+      {
+        std::cout << "成功保存地图到: " << file_path
+                  << ", 点数: " << cloud_to_save->size() << std::endl;
+      }
+      else
+      {
+        std::cerr << "保存地图失败: " << file_path << std::endl;
+      }
+    }
+  }
+}
+
 /** \brief publish odometry infomation
   * \param[in] newPose: pose to be published
   * \param[in] timefullCloud: time stamp
@@ -45,7 +127,7 @@ void pubOdometry(const Eigen::Matrix4d& newPose, double& timefullCloud){
   Eigen::Matrix3d Rcurr = newPose.topLeftCorner(3, 3);
   Eigen::Quaterniond newQuat(Rcurr);
   Eigen::Vector3d newPosition = newPose.topRightCorner(3, 1);
-  laserOdometry.header.frame_id = "/world";
+  laserOdometry.header.frame_id = "world";
   laserOdometry.child_frame_id = "/livox_frame";
   laserOdometry.header.stamp = ros::Time().fromSec(timefullCloud);
   laserOdometry.pose.pose.orientation.x = newQuat.x();
@@ -62,10 +144,10 @@ void pubOdometry(const Eigen::Matrix4d& newPose, double& timefullCloud){
   laserPose.pose = laserOdometry.pose.pose;
   laserOdoPath.header.stamp = laserOdometry.header.stamp;
   laserOdoPath.poses.push_back(laserPose);
-  laserOdoPath.header.frame_id = "/world";
+  laserOdoPath.header.frame_id = "world";
   pubLaserOdometryPath.publish(laserOdoPath);
 
-  laserOdometryTrans.frame_id_ = "/world";
+  laserOdometryTrans.frame_id_ = "world";
   laserOdometryTrans.child_frame_id_ = "/livox_frame";
   laserOdometryTrans.stamp_ = ros::Time().fromSec(timefullCloud);
   laserOdometryTrans.setRotation(tf::Quaternion(newQuat.x(), newQuat.y(), newQuat.z(), newQuat.w()));
@@ -508,9 +590,49 @@ void process(){
         MAP_MANAGER::pointAssociateToMap(&lidar_list->front().laserCloud->points[i], &temp_point, transformTobeMapped);
         laserCloudAfterEstimate->push_back(temp_point);
       }
+
+      // Liu Kaiyang 地图保存相关代码开始
+      // 根据配置决定是否保存地图
+      if (enable_map_save)
+      {
+        pcl::PointCloud<PointType>::Ptr cloud_to_save(new pcl::PointCloud<PointType>());
+
+        // 根据配置决定是否进行降采样
+        if (voxel_size > 0.0f)
+        {
+          // 应用降采样减少点云数据量
+          voxel_grid.setInputCloud(laserCloudAfterEstimate);
+          voxel_grid.setLeafSize(voxel_size, voxel_size, voxel_size);
+          voxel_grid.filter(*cloud_to_save);
+        }
+        else
+        {
+          // 不进行降采样，保存原始点云
+          *cloud_to_save = *laserCloudAfterEstimate;
+        }
+
+        // 累积点云数据
+        *pcl_wait_save += *cloud_to_save;
+
+        // 基于点云大小阈值触发保存 (注意类型转换)
+        if (pcl_wait_save->size() > static_cast<size_t>(save_threshold))
+        {
+          // 将点云数据添加到保存队列
+          {
+            std::lock_guard<std::mutex> lock(save_queue_mutex);
+            save_queue.push(pcl_wait_save);
+          }
+          save_condition.notify_one();
+
+          // 创建新的点云容器继续累积数据
+          pcl_wait_save.reset(new pcl::PointCloud<PointType>());
+        }
+      }
+      // Liu Kaiyang 地图保存相关代码结束
+
       sensor_msgs::PointCloud2 laserCloudMsg;
       pcl::toROSMsg(*laserCloudAfterEstimate, laserCloudMsg);
-      laserCloudMsg.header.frame_id = "/world";
+      laserCloudMsg.header.frame_id = "world";
       laserCloudMsg.header.stamp.fromSec(lidar_list->front().timeStamp);
       pubFullLaserCloud.publish(laserCloudMsg);
 
@@ -576,6 +698,45 @@ int main(int argc, char** argv)
 	std::vector<double> vecTlb;
 	ros::param::get("~Extrinsic_Tlb",vecTlb);
 
+  // Liu Kaiyang 地图保存相关参数开始
+  ros::param::get("~enable_map_save", enable_map_save);
+  ros::param::get("~map_save_path", map_save_path);
+  ros::param::get("~save_threshold", save_threshold);
+  ros::param::get("~voxel_size", voxel_size);
+
+  // 启动保存线程（如果启用地图保存）
+  if (enable_map_save)
+  {
+    // 确保路径以'/'结尾
+    if (!map_save_path.empty() && map_save_path.back() != '/')
+    {
+      map_save_path += "/";
+    }
+
+    // 检查并创建目录
+    struct stat info;
+    if (stat(map_save_path.c_str(), &info) != 0)
+    {
+      // 目录不存在，尝试创建
+      if (mkdir(map_save_path.c_str(), 0755) != 0)
+      {
+        ROS_WARN("无法创建地图保存目录: %s", map_save_path.c_str());
+      }
+      else
+      {
+        ROS_INFO("创建地图保存目录: %s", map_save_path.c_str());
+      }
+    }
+    else if (!(info.st_mode & S_IFDIR))
+    {
+      ROS_WARN("指定路径不是目录: %s", map_save_path.c_str());
+    }
+
+    // 启动保存线程（如果启用地图保存）
+    save_thread = std::thread(saveThread);
+  }
+  // Liu Kaiyang 地图保存相关参数结束
+
   // set extrinsic matrix between lidar & IMU
   Eigen::Matrix3d R;
   Eigen::Vector3d t;
@@ -614,6 +775,32 @@ int main(int argc, char** argv)
 
   std::thread thread_process{process};
   ros::spin();
+
+  // Liu Kaiyang 地图保存相关代码开始
+  // 清理保存线程
+  if (enable_map_save)
+  {
+    // 保存任何剩余数据
+    if (pcl_wait_save && !pcl_wait_save->empty())
+    {
+      {
+        std::lock_guard<std::mutex> lock(save_queue_mutex);
+        save_queue.push(pcl_wait_save);
+      }
+      save_condition.notify_one();
+    }
+
+    // 发送停止信号给保存线程
+    save_thread_running = false;
+    save_condition.notify_all();
+
+    // 等待保存线程结束
+    if (save_thread.joinable())
+    {
+      save_thread.join();
+    }
+  }
+  // Liu Kaiyang 地图保存相关代码结束
 
   return 0;
 }
