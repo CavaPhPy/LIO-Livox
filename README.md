@@ -71,7 +71,7 @@ Simultaneously, an extra thread builds and maintains the global map in parallel.
 *  [Ubuntu](http://ubuntu.com) (tested on 16.04 and 18.04)
 *  [ROS](http://wiki.ros.org/ROS/Installation) (tested with Kinetic and Melodic)
 *  [Eigen](http://eigen.tuxfamily.org/index.php?title=Main_Page)
-*  [Ceres Solver](http://ceres-solver.org/installation.html)，使用2.0版本：[历史版本地址](https://github.com/ceres-solver/ceres-solver/tags)
+*  [Ceres Solver](http://ceres-solver.org/installation.html) 注：使用2.0版本，太新会有问题：[历史版本地址](https://github.com/ceres-solver/ceres-solver/tags)
 *  [PCL](http://www.pointclouds.org/downloads/linux.html)
 *  [livox_ros_driver2](https://github.com/Livox-SDK/livox_ros_driver2)
 *  Suitesparse
@@ -82,7 +82,7 @@ Simultaneously, an extra thread builds and maintains the global map in parallel.
 ## Compilation
 ```
 cd ~/catkin_ws/src
-git clone https://github.com/Livox-SDK/LIO-Livox
+git clone https://github.com/CavaPhPy/LIO-Livox
 cd ..
 catkin_make
 ```
@@ -92,7 +92,7 @@ catkin_make
 ```
 cd ~/catkin_ws
 source devel/setup.bash
-roslaunch lio_livox horizon.launch
+roslaunch lio_livox mid360.launch
 ```
 
 #### Play your bag files:
