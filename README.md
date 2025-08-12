@@ -10,6 +10,23 @@
 * ubuntu20.04
 * ROS Noetic
 
+注：本分支为异步流式保存点云为laz格式的分支，但因pdal依赖安装，工程角度上不确定能否升级，所以未进行进一步测试，甚至可能还需处理编译问题
+
+需要额外安装依赖
+
+* PDAL
+
+    ```bash
+    # 添加依赖源，默认的ubuntu20.04源，pdal最多只有2.0.1版本，不支持流式写入
+    sudo add-apt-repository ppa:pdal/ppa
+    # 更新软件包列表
+    sudo apt-get update
+    # 安装新版 PDAL，建议使用2.4.x即可
+    sudo apt-get install libpdal-dev pdal
+    ```
+
+
+
 # LIO-Livox (A Robust LiDAR-Inertial Odometry for Livox LiDAR)
 This respository implements a robust LiDAR-inertial odometry system for Livox LiDAR. 
 The system uses only a single Livox LiDAR with a built-in IMU. It has a robust initialization module, 
