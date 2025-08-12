@@ -18,18 +18,17 @@
                                          -0.0025826, 0.9999741, -0.0067201, -0.0234,
                                          -0.0126883, 0.0066868,  0.9998971,   0.044,
                                                 0.0,       0.0,        0.0,      1.0]</rosparam>
-        
+
         <!-- Liu Kaiyang 地图保存相关参数开始 -->
         <!-- 是否开启地图保存功能 -->
-        <param name="enable_map_save" type="bool" value="false" />
+        <param name="enable_map_save" type="bool" value="true" />
         <!-- 地图保存路径，路径以'/'结尾 -->
         <param name="map_save_path" type="string" value="$(find lio_livox)/maps/" />
-        <!-- 地图保存点云大小阈值，达到该数量时触发保存 -->
-        <param name="save_threshold" type="int" value="1000000" />
+        <!-- 完整地图保存间隔（帧数） -->
+        <param name="full_map_save_interval" type="int" value="500" />
         <!-- 地图保存降采样粒度(单位:米)，设置为0或负数时禁用降采样 -->
         <param name="voxel_size" type="double" value="0.15" />
         <!-- Liu Kaiyang 地图保存相关参数结束 -->
-
     </node>
 
     <node launch-prefix="nice" pkg="rviz" type="rviz" name="rviz" args="-d $(find lio_livox)/rviz_cfg/lio.rviz" />

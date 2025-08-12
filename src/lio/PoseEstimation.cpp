@@ -49,8 +49,8 @@ nav_msgs::Path laserOdoPath;
 bool enable_map_save = false;
 // 地图保存路径
 std::string map_save_path = "../../maps/";
-// 点云大小阈值
-int save_threshold = 1000000;
+// 完整地图保存间隔（帧数）
+int full_map_save_interval = 500;
 // 降采样粒度
 float voxel_size = 0.15f;
 // 降采样滤波器
@@ -62,7 +62,9 @@ std::condition_variable save_condition;
 std::thread save_thread;
 std::atomic<bool> save_thread_running{false};
 
-pcl::PointCloud<PointType>::Ptr pcl_wait_save(new pcl::PointCloud<PointType>());
+// 添加全局地图变量
+pcl::PointCloud<PointType>::Ptr global_map_cloud(new pcl::PointCloud<PointType>());
+std::mutex global_map_mutex;
 // Liu Kaiyang 地图保存相关参数结束
 
 /** \brief Liu Kaiyang 异步点云保存线程函数
@@ -611,21 +613,27 @@ void process(){
           *cloud_to_save = *laserCloudAfterEstimate;
         }
 
-        // 累积点云数据
-        *pcl_wait_save += *cloud_to_save;
-
-        // 基于点云大小阈值触发保存 (注意类型转换)
-        if (pcl_wait_save->size() > static_cast<size_t>(save_threshold))
+        // 累积到全局地图
         {
-          // 将点云数据添加到保存队列
+          std::lock_guard<std::mutex> lock(global_map_mutex);
+          *global_map_cloud += *cloud_to_save;
+        }
+
+        // 定期保存完整地图（每处理100帧保存一次）
+        static int save_counter = 0;
+        if (++save_counter % full_map_save_interval == 0)
+        {
+          pcl::PointCloud<PointType>::Ptr map_copy(new pcl::PointCloud<PointType>());
+          {
+            std::lock_guard<std::mutex> lock(global_map_mutex);
+            *map_copy = *global_map_cloud;
+          }
+
           {
             std::lock_guard<std::mutex> lock(save_queue_mutex);
-            save_queue.push(pcl_wait_save);
+            save_queue.push(map_copy);
           }
           save_condition.notify_one();
-
-          // 创建新的点云容器继续累积数据
-          pcl_wait_save.reset(new pcl::PointCloud<PointType>());
         }
       }
       // Liu Kaiyang 地图保存相关代码结束
@@ -701,7 +709,7 @@ int main(int argc, char** argv)
   // Liu Kaiyang 地图保存相关参数开始
   ros::param::get("~enable_map_save", enable_map_save);
   ros::param::get("~map_save_path", map_save_path);
-  ros::param::get("~save_threshold", save_threshold);
+  ros::param::get("~full_map_save_interval", full_map_save_interval);
   ros::param::get("~voxel_size", voxel_size);
 
   // 启动保存线程（如果启用地图保存）
@@ -780,12 +788,17 @@ int main(int argc, char** argv)
   // 清理保存线程
   if (enable_map_save)
   {
-    // 保存任何剩余数据
-    if (pcl_wait_save && !pcl_wait_save->empty())
+    // 保存最终完整地图
+    if (global_map_cloud && !global_map_cloud->empty())
     {
+      pcl::PointCloud<PointType>::Ptr final_map(new pcl::PointCloud<PointType>());
+      {
+        std::lock_guard<std::mutex> lock(global_map_mutex);
+        *final_map = *global_map_cloud;
+      }
       {
         std::lock_guard<std::mutex> lock(save_queue_mutex);
-        save_queue.push(pcl_wait_save);
+        save_queue.push(final_map);
       }
       save_condition.notify_one();
     }
