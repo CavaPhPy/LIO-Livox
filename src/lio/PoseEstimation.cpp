@@ -6,8 +6,14 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+// 添加PDAL头文件用于LAZ格式保存
+#include <pdal/StageFactory.hpp>
+#include <pdal/PointView.hpp>
+#include <pdal/PointTable.hpp>
+#include <pdal/Options.hpp>
+#include <pdal/PointLayout.hpp>
+#include <pdal/Dimension.hpp>
 // Liu Kaiyang 地图保存相关头文件结束
-
 typedef pcl::PointXYZINormal PointType;
 
 int WINDOWSIZE;
@@ -49,8 +55,6 @@ nav_msgs::Path laserOdoPath;
 bool enable_map_save = false;
 // 地图保存路径
 std::string map_save_path = "../../maps/";
-// 点云大小阈值
-int save_threshold = 1000000;
 // 降采样粒度
 float voxel_size = 0.15f;
 // 降采样滤波器
@@ -62,59 +66,128 @@ std::condition_variable save_condition;
 std::thread save_thread;
 std::atomic<bool> save_thread_running{false};
 
-pcl::PointCloud<PointType>::Ptr pcl_wait_save(new pcl::PointCloud<PointType>());
+// 流式写入器相关变量
+// PDAL的Pipeline管道
+pdal::StageFactory factory;
+// 使用一个 Stage 作为管道的根
+std::unique_ptr<pdal::Stage> pipeline;
+// 用于保护PDAL管道的互斥锁
+std::mutex pdal_pipeline_mutex;
+std::atomic<bool> laz_writer_initialized{false};
 // Liu Kaiyang 地图保存相关参数结束
 
-/** \brief Liu Kaiyang 异步点云保存线程函数
+/** \brief Liu Kaiyang 异步点云保存线程函数（LAZ流式写入版本）
  */
 void saveThread()
 {
   save_thread_running = true;
+  pdal::PointTable table;
 
-  while (save_thread_running)
+  // 在线程启动时创建并准备PDAL管道
+  try
+  {
+    std::unique_ptr<pdal::Stage> writer = factory.createStage("writers.las");
+    pdal::Options writer_options;
+    auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+                   .count();
+    std::string current_file = map_save_path + "scans_" + std::to_string(now) + ".laz";
+    writer_options.add("filename", current_file);
+    writer_options.add("compression", true);
+    writer_options.add("minor_version", 4);
+    writer->setOptions(writer_options);
+
+    pipeline = std::move(writer); // 将writer作为管道根
+
+    // 管道准备阶段：初始化点云布局
+    table.layout()->registerDim(pdal::Dimension::Id::X);
+    table.layout()->registerDim(pdal::Dimension::Id::Y);
+    table.layout()->registerDim(pdal::Dimension::Id::Z);
+    table.layout()->registerDim(pdal::Dimension::Id::Intensity);
+
+    pipeline->prepare(table);
+    laz_writer_initialized = true;
+    ROS_INFO("LAZ流式写入器初始化完成: %s", current_file.c_str());
+  }
+  catch (const std::exception &e)
+  {
+    ROS_ERROR("LAZ写入器初始化失败: %s", e.what());
+    save_thread_running = false;
+    return;
+  }
+
+  while (save_thread_running || !save_queue.empty())
   {
     pcl::PointCloud<PointType>::Ptr cloud_to_save;
 
-    // 等待数据或关闭信号
-    std::unique_lock<std::mutex> lock(save_queue_mutex);
-    save_condition.wait(lock, []
-                        { return !save_queue.empty() || !save_thread_running.load(); });
-
-    if (!save_thread_running.load() && save_queue.empty())
     {
-      break;
-    }
+      std::unique_lock<std::mutex> lock(save_queue_mutex);
+      // 等待直到队列非空或线程停止
+      save_condition.wait(lock, [&]
+                          { return !save_queue.empty() || !save_thread_running.load(); });
 
-    if (!save_queue.empty())
-    {
+      if (!save_thread_running && save_queue.empty())
+      {
+        break;
+      }
+      if (save_queue.empty())
+      {
+        continue;
+      }
+
       cloud_to_save = save_queue.front();
       save_queue.pop();
     }
-    lock.unlock();
 
-    // 执行实际的文件保存操作
-    if (cloud_to_save && !cloud_to_save->empty())
+    if (!cloud_to_save || cloud_to_save->empty())
     {
-      // 使用时间戳命名，避免重复
-      auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
-                     std::chrono::system_clock::now().time_since_epoch())
-                     .count();
-      std::string file_path = map_save_path + "scans_" + std::to_string(now) + ".pcd";
+      continue;
+    }
 
-      pcl::PCDWriter pcd_writer;
-      int result = pcd_writer.writeBinaryCompressed(file_path, *cloud_to_save);
+    // 流式追加点云
+    try
+    {
+      // 创建一个临时的 PointView 来存储当前点云块
+      pdal::PointView view(table);
 
-      if (result == 0)
+      size_t added_points = 0;
+      for (const auto &point : cloud_to_save->points)
       {
-        std::cout << "成功保存地图到: " << file_path
-                  << ", 点数: " << cloud_to_save->size() << std::endl;
+        if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z))
+        {
+          continue;
+        }
+
+        // 添加点到PointView
+        pdal::PointId id = view.size();
+        view.setField(pdal::Dimension::Id::X, id, point.x);
+        view.setField(pdal::Dimension::Id::Y, id, point.y);
+        view.setField(pdal::Dimension::Id::Z, id, point.z);
+
+        if (std::isfinite(point.intensity))
+        {
+          view.setField(pdal::Dimension::Id::Intensity, id, static_cast<uint16_t>(point.intensity));
+        }
+        added_points++;
       }
-      else
-      {
-        std::cerr << "保存地图失败: " << file_path << std::endl;
-      }
+
+      // 使用 PDAL 管道的 process 方法来流式写入数据块
+      // 注意：这里不需要锁，因为只有这个线程访问pipeline
+      pipeline->process(table, &view);
+      ROS_INFO("成功追加 %zu 个点到LAZ文件", added_points);
+    }
+    catch (const std::exception &e)
+    {
+      ROS_ERROR("点云追加失败: %s", e.what());
     }
   }
+
+  // 线程退出前，调用管道的done方法，确保所有数据都已写入并关闭文件
+  if (pipeline)
+  {
+    pipeline->done(table);
+  }
+  ROS_INFO("保存线程退出");
 }
 
 /** \brief publish odometry infomation
@@ -597,35 +670,26 @@ void process(){
       {
         pcl::PointCloud<PointType>::Ptr cloud_to_save(new pcl::PointCloud<PointType>());
 
-        // 根据配置决定是否进行降采样
+        // 降采样处理
         if (voxel_size > 0.0f)
         {
-          // 应用降采样减少点云数据量
           voxel_grid.setInputCloud(laserCloudAfterEstimate);
           voxel_grid.setLeafSize(voxel_size, voxel_size, voxel_size);
           voxel_grid.filter(*cloud_to_save);
         }
         else
         {
-          // 不进行降采样，保存原始点云
           *cloud_to_save = *laserCloudAfterEstimate;
         }
 
-        // 累积点云数据
-        *pcl_wait_save += *cloud_to_save;
-
-        // 基于点云大小阈值触发保存 (注意类型转换)
-        if (pcl_wait_save->size() > static_cast<size_t>(save_threshold))
+        // 直接放入保存队列，不累积全局地图
+        // 在放入队列前添加基本检查
+        if (cloud_to_save && !cloud_to_save->empty())
         {
-          // 将点云数据添加到保存队列
-          {
-            std::lock_guard<std::mutex> lock(save_queue_mutex);
-            save_queue.push(pcl_wait_save);
-          }
+          std::lock_guard<std::mutex> lock(save_queue_mutex);
+          save_queue.push(cloud_to_save);
           save_condition.notify_one();
-
-          // 创建新的点云容器继续累积数据
-          pcl_wait_save.reset(new pcl::PointCloud<PointType>());
+          ROS_DEBUG("已添加点云到保存队列，点数: %zu", cloud_to_save->size());
         }
       }
       // Liu Kaiyang 地图保存相关代码结束
@@ -701,7 +765,6 @@ int main(int argc, char** argv)
   // Liu Kaiyang 地图保存相关参数开始
   ros::param::get("~enable_map_save", enable_map_save);
   ros::param::get("~map_save_path", map_save_path);
-  ros::param::get("~save_threshold", save_threshold);
   ros::param::get("~voxel_size", voxel_size);
 
   // 启动保存线程（如果启用地图保存）
@@ -717,7 +780,6 @@ int main(int argc, char** argv)
     struct stat info;
     if (stat(map_save_path.c_str(), &info) != 0)
     {
-      // 目录不存在，尝试创建
       if (mkdir(map_save_path.c_str(), 0755) != 0)
       {
         ROS_WARN("无法创建地图保存目录: %s", map_save_path.c_str());
@@ -732,7 +794,7 @@ int main(int argc, char** argv)
       ROS_WARN("指定路径不是目录: %s", map_save_path.c_str());
     }
 
-    // 启动保存线程（如果启用地图保存）
+    // 启动保存线程，PDAL的初始化将在线程内完成
     save_thread = std::thread(saveThread);
   }
   // Liu Kaiyang 地图保存相关参数结束
@@ -740,14 +802,14 @@ int main(int argc, char** argv)
   // set extrinsic matrix between lidar & IMU
   Eigen::Matrix3d R;
   Eigen::Vector3d t;
-	R << vecTlb[0], vecTlb[1], vecTlb[2],
-	     vecTlb[4], vecTlb[5], vecTlb[6],
-	     vecTlb[8], vecTlb[9], vecTlb[10];
-	t << vecTlb[3], vecTlb[7], vecTlb[11];
+  R << vecTlb[0], vecTlb[1], vecTlb[2],
+      vecTlb[4], vecTlb[5], vecTlb[6],
+      vecTlb[8], vecTlb[9], vecTlb[10];
+  t << vecTlb[3], vecTlb[7], vecTlb[11];
   Eigen::Quaterniond qr(R);
   R = qr.normalized().toRotationMatrix();
-  exTlb.topLeftCorner(3,3) = R;
-  exTlb.topRightCorner(3,1) = t;
+  exTlb.topLeftCorner(3, 3) = R;
+  exTlb.topRightCorner(3, 1) = t;
   exRlb = R;
   exRbl = R.transpose();
   exPlb = t;
@@ -755,23 +817,23 @@ int main(int argc, char** argv)
 
   ros::Subscriber subFullCloud = nodeHandler.subscribe<sensor_msgs::PointCloud2>("/livox_full_cloud", 10, fullCallBack);
   ros::Subscriber sub_imu;
-  if(IMU_Mode > 0)
+  if (IMU_Mode > 0)
     sub_imu = nodeHandler.subscribe("/livox/imu", 2000, imu_callback, ros::TransportHints().unreliable());
-  if(IMU_Mode < 2)
+  if (IMU_Mode < 2)
     WINDOWSIZE = 1;
   else
     WINDOWSIZE = 20;
 
   pubFullLaserCloud = nodeHandler.advertise<sensor_msgs::PointCloud2>("/livox_full_cloud_mapped", 10);
-  pubLaserOdometry = nodeHandler.advertise<nav_msgs::Odometry> ("/livox_odometry_mapped", 5);
-  pubLaserOdometryPath = nodeHandler.advertise<nav_msgs::Path> ("/livox_odometry_path_mapped", 5);
-	pubGps = nodeHandler.advertise<sensor_msgs::NavSatFix>("/lidar", 1000);
+  pubLaserOdometry = nodeHandler.advertise<nav_msgs::Odometry>("/livox_odometry_mapped", 5);
+  pubLaserOdometryPath = nodeHandler.advertise<nav_msgs::Path>("/livox_odometry_path_mapped", 5);
+  pubGps = nodeHandler.advertise<sensor_msgs::NavSatFix>("/lidar", 1000);
 
   tfBroadcaster = new tf::TransformBroadcaster();
 
   laserCloudFullRes.reset(new pcl::PointCloud<PointType>);
   estimator = new Estimator(filter_parameter_corner, filter_parameter_surf);
-	lidarFrameList.reset(new std::list<Estimator::LidarFrame>);
+  lidarFrameList.reset(new std::list<Estimator::LidarFrame>);
 
   std::thread thread_process{process};
   ros::spin();
@@ -780,18 +842,9 @@ int main(int argc, char** argv)
   // 清理保存线程
   if (enable_map_save)
   {
-    // 保存任何剩余数据
-    if (pcl_wait_save && !pcl_wait_save->empty())
-    {
-      {
-        std::lock_guard<std::mutex> lock(save_queue_mutex);
-        save_queue.push(pcl_wait_save);
-      }
-      save_condition.notify_one();
-    }
-
     // 发送停止信号给保存线程
     save_thread_running = false;
+    // 唤醒可能等待的线程
     save_condition.notify_all();
 
     // 等待保存线程结束
@@ -799,6 +852,9 @@ int main(int argc, char** argv)
     {
       save_thread.join();
     }
+
+    // 不需要显式调用done，PDAL会在析构时自动处理
+    ROS_INFO("LAZ保存线程已正确退出");
   }
   // Liu Kaiyang 地图保存相关代码结束
 

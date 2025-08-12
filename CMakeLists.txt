@@ -32,6 +32,9 @@ find_package(PCL REQUIRED)
 find_package(Ceres REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(SuiteSparse REQUIRED)
+# 添加 PDAL 查找
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(PDAL REQUIRED pdal)
 
 include_directories(include
         	    ${catkin_INCLUDE_DIRS}
@@ -39,7 +42,8 @@ include_directories(include
 		    ${PCL_INCLUDE_DIRS}
         	    ${CERES_INCLUDE_DIRS}
 		    ${OpenCV_INCLUDE_DIRS}
-        	    ${SUITESPARSE_INCLUDE_DIRS})
+        	    ${SUITESPARSE_INCLUDE_DIRS}
+				${PDAL_INCLUDE_DIRS})
 
 ##################
 ## ROS messages ##
@@ -64,7 +68,6 @@ add_executable (PoseEstimation
 		src/lio/IMUIntegrator.cpp
 		src/lio/ceresfunc.cpp 
 		src/lio/Map_Manager.cpp)
-target_link_libraries(PoseEstimation ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${CERES_LIBRARIES})
-
+target_link_libraries(PoseEstimation ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${CERES_LIBRARIES} ${PDAL_LIBRARIES})
 
 
